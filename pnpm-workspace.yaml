@@ -1,0 +1,12 @@
+# pnpm 11 records build-script approvals here. `true` lets the dependency run its
+# postinstall/build script; an undecided entry makes `pnpm install` — and every
+# `pnpm <script>` (which runs a verify-install first) — exit 1 with
+# ERR_PNPM_IGNORED_BUILDS. These are all trusted toolchain deps.
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  prisma: true
+  bcryptjs: true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

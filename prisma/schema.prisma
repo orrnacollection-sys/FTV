@@ -1,0 +1,1524 @@
+// Adwitiya FTV — schema
+// SQLite for dev, Postgres for prod. Swap `provider` + DATABASE_URL when deploying.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  email        String    @unique
+  passwordHash String
+  /// "ADMIN" | "VENDOR_ADMIN" | "VENDOR_USER"
+  role         String    @default("ADMIN")
+  vendorId     String?
+  vendor       Vendor?   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  isActive     Boolean   @default(true)
+  /// Editor gate. Admins without this flag are view-only — Edit / Delete /
+  /// Save buttons are hidden and mutating server actions refuse to run.
+  /// Existing admins are backfilled to true; newly created users default to
+  /// false until a super-admin grants editing.
+  canEdit      Boolean   @default(false)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  invitesSent  VendorInvite[]
+  /// Companies this user can access. ADMINs implicitly access all
+  /// companies; vendor users only get explicit grants. The active
+  /// company is stored in a cookie at runtime.
+  companies    UserCompany[]
+
+  @@index([vendorId])
+  @@index([role])
+}
+
+/// License granted to the installation (#136). One row per issued
+/// license key. The key encodes plan + seats + features + expiry +
+/// HMAC signature; the verifier rejects tampered or expired keys.
+///
+/// Lifecycle: ISSUED (minted, not yet activated) → ACTIVE (activated
+/// in this installation; signature verified) → EXPIRED (past
+/// expiresAt) or REVOKED (admin / ops action).
+///
+/// At any moment, AT MOST ONE row should be in ACTIVE status. The
+/// helper enforces this — activating a new key demotes the prior
+/// active one to REPLACED.
+model License {
+  id           String   @id @default(cuid())
+  /// The signed license key admin pastes in. Format:
+  ///   FTV-<base64url payload>.<hex hmac>
+  /// The payload is a JSON blob (plan / seats / features / expiry /
+  /// issuedTo / nonce). The hmac is computed with LICENSE_SIGNING_KEY.
+  key          String   @unique
+  /// "TRIAL" | "BASIC" | "PRO" | "ENTERPRISE" — plan tier.
+  plan         String
+  /// Maximum number of active Company rows this license permits.
+  /// 1 for TRIAL/BASIC, 5 for PRO, unlimited (Number.MAX_SAFE_INTEGER) for ENTERPRISE.
+  seats        Int
+  /// Maximum User rows; 0 = unlimited.
+  maxUsers     Int      @default(0)
+  /// JSON array of feature keys this plan unlocks. Verified against
+  /// the signed payload at activation; this column is the read-side
+  /// cache used by `hasFeature()` at runtime.
+  features     String   @default("[]")
+  /// Human-readable customer name printed on the key for support.
+  issuedTo     String
+  /// "ISSUED" | "ACTIVE" | "EXPIRED" | "REVOKED" | "REPLACED"
+  status       String   @default("ISSUED")
+  issuedAt     DateTime
+  expiresAt    DateTime
+  activatedAt  DateTime?
+  /// Free-text — ops notes, contract reference, etc.
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([status])
+  @@index([expiresAt])
+}
+
+/// User ↔ Company access grant (#134). One row per user per company
+/// they're allowed to load. Admins skip this table — they see all
+/// active companies. Vendor users must have an explicit grant.
+model UserCompany {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyId  String
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /// "OWNER" | "ADMIN" | "VIEWER" — granular permissions land later;
+  /// today OWNER and ADMIN both have full access, VIEWER is read-only.
+  role       String   @default("OWNER")
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, companyId])
+  @@index([companyId])
+}
+
+model VendorInvite {
+  id          String    @id @default(cuid())
+  token       String    @unique
+  email       String
+  /// "ADMIN" | "VENDOR_ADMIN" | "VENDOR_USER"
+  role        String
+  vendorId    String?
+  vendor      Vendor?   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  invitedById String
+  invitedBy   User      @relation(fields: [invitedById], references: [id], onDelete: Restrict)
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([email])
+  @@index([vendorId])
+  @@index([email, acceptedAt])
+}
+
+// ─── Masters ─────────────────────────────────────────────────────────────────
+model Vendor {
+  id         String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  /// Auto-generated as <first-4-letters-of-name>-<model> (collision -2/-3/…).
+  /// Null while a PENDING application waits for the admin to assign the model.
+  code       String?  @unique
+  name       String
+  email      String?  @unique
+  whatsapp   String?
+  gst        String?
+  /// GST registration type — drives ITC eligibility on purchases.
+  /// COMPOSITION vendors can't issue ITC-eligible invoices; UNREGISTERED
+  /// purchases may trigger reverse-charge (RCM) liability for us.
+  gstRegType String   @default("UNREGISTERED")
+  pan        String?
+  ifsc       String?
+  bankName   String?
+  accountNo  String?
+  /// Free-form street / line 1. Kept for legacy compatibility — new vendors
+  /// fill the structured city/state/pincode fields below instead.
+  address    String?
+  /// City — populated for new vendors. Null on legacy rows until manually filled.
+  city       String?
+  /// State — one of INDIAN_STATES (lib/constants). Drives IGST vs CGST+SGST
+  /// later, and is the from-pincode source for shipping integrations.
+  state      String?
+  /// 6-digit Indian pincode. Required when state is set.
+  pincode    String?
+  /// ISO 3166-1 short name. Defaults to "India" for new vendors; non-Indian
+  /// vendors (overseas exporters, importers) are allowed but rare.
+  country    String?  @default("India")
+  /// "FTV" | "OR" | "FTV_NORETURN" — assigned at creation or at admin approval.
+  /// Null while PENDING. Items inherit this — there's no Item.model anymore.
+  model      String?
+  /// "ACTIVE" | "INACTIVE" | "PENDING"
+  status     String   @default("ACTIVE")
+  /// Window (in days) after which unsold inventory at this vendor is flagged
+  /// "stale" by the Stale Stock report and a candidate for RTV. Null = use the
+  /// system default (120 days). Configurable per vendor per agreement.
+  staleDays  Int?
+
+  // — Onboarding application fields (optional — populated by /apply flow) —
+  contactName        String?
+  designation        String?
+  website            String?
+  /// "MANUFACTURER" | "TRADER_WHOLESALER" | "BOUTIQUE_DESIGNER" | "IMPORTER" | "OTHER"
+  businessType       String?
+  yearsInBusiness    String?
+  referralSource     String?
+  productCategoryHint String?
+  productCountRange  String?
+  priceRange         String?
+  catalogLink        String?
+  samplesLink        String?
+  applicationNotes   String?
+  /// "CURRENT" | "SAVINGS"
+  accountType        String?
+  branch             String?
+  gstCertUrl         String?
+  chequeUrl          String?
+  appliedAt          DateTime?
+  reviewedAt         DateTime?
+  reviewedById       String?
+  reviewNotes        String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  items           Item[]
+  users           User[]
+  invites         VendorInvite[]
+  purchaseOrders  PurchaseOrder[]
+  grns            GRN[]
+  payments        Payment[]
+  /// Third-party warehouses operated by this vendor (consignment locations etc.).
+  warehouses      Warehouse[]
+  otherCharges    OtherCharge[]
+  orPayments      OrPayment[]
+  ledger          ChartOfAccount?
+  bankTxns        BankTransaction[]
+  openingBalances VendorOpeningBalance[]
+
+  @@index([name])
+  @@index([companyId])
+}
+
+/// Per-vendor, per-model opening balance at go-live, imported DIRECTLY
+/// (independent of inventory). The figure is the real amount owed — pending +
+/// unsold stock + shipping/penalty/adjustments — not derived from stock.
+/// Feeds the operational Vendor Ledger (so the OR / FTV Payment screens open
+/// from the right balance) and the GL (vendor's Sundry Creditors sub-ledger
+/// opening = net CR−DR across models).
+model VendorOpeningBalance {
+  id        String   @id @default(cuid())
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  vendorId  String
+  vendor    Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  /// "FTV" | "OR" | "FTV_NORETURN" — the payment basis this opening settles under.
+  model     String
+  /// Magnitude (positive); sign comes from drCr.
+  amount    Float
+  /// "CR" = we owe the vendor (typical); "DR" = vendor owes us (advance).
+  drCr      String   @default("CR")
+  asOf      DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([vendorId, model])
+  @@index([vendorId])
+  @@index([companyId])
+}
+
+model Category {
+  id        String     @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  name      String
+  parentId  String?
+  parent    Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children  Category[] @relation("CategoryTree")
+  items     Item[]
+  createdAt DateTime   @default(now())
+
+  @@unique([name, parentId])
+  @@index([companyId])
+}
+
+model Item {
+  id          String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  skuCode     String   @unique
+  name        String
+  hsn         String?
+  categoryId  String?
+  category    Category? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  vendorId    String
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  vendorSku   String?
+  imageUrl    String?
+  /// GOODS = stock-tracked (GRN, inventory, valuation). SERVICE = billing-only,
+  /// never receivable into stock and excluded from every inventory report.
+  itemType    String   @default("GOODS")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  priceRevisions ItemPriceRevision[]
+  poItems        PurchaseOrderItem[]
+  grnItems       GRNItem[]
+  sales          Sale[]
+  transfers      WarehouseTransfer[]
+  adjustments    StockAdjustment[]
+  marketplaceOrders MarketplaceOrder[]
+  marketingCosts    MarketingCost[]
+
+  @@index([name])
+  @@index([vendorId])
+  @@index([categoryId])
+  @@index([companyId])
+}
+
+model ItemPriceRevision {
+  id            String   @id @default(cuid())
+  itemId        String
+  item          Item     @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  transferPrice Float
+  taxRate       Float
+  /// Business model effective for this revision ("FTV" | "OR" | "FTV_NORETURN").
+  /// Resolved by transaction date alongside price. Null only for un-backfilled rows.
+  model         String?
+  effectiveDate DateTime
+  createdAt     DateTime @default(now())
+
+  @@index([itemId, effectiveDate])
+}
+
+model Warehouse {
+  id          String            @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code        String            @unique
+  name        String
+  /// Free-form street / line 1. Kept for legacy compatibility.
+  address     String?
+  /// City — populated for new warehouses.
+  city        String?
+  /// State — one of INDIAN_STATES (lib/constants). Used for IGST/CGST split
+  /// and as the pickup-state source for shipping integrations.
+  state       String?
+  /// 6-digit Indian pincode. Required when state is set.
+  pincode     String?
+  /// ISO 3166-1 short name. Defaults to "India". Future-proofs warehouses
+  /// outside India once we expand.
+  country     String?  @default("India")
+  /// FK to the CompanyGSTINPlace declared on GST for this warehouse. Null
+  /// for THIRD_PARTY warehouses (vendor's GSTIN, not ours) and for OWN
+  /// warehouses still pending REG-14 amendment. When set, drives the
+  /// ship-from GSTIN + declared address on invoices.
+  placeId     String?  @unique
+  place       CompanyGSTINPlace? @relation(fields: [placeId], references: [id], onDelete: SetNull)
+  /// GSTIN registered at this warehouse address. Each state where Adwitiya
+  /// operates needs its own GSTIN (India's GST is state-scoped), so different
+  /// warehouses in different states will have different GSTINs. Drives the
+  /// "ship-from GSTIN" on invoices and the CGST/SGST vs IGST split.
+  gst         String?
+  /// Ownership: "OWN" for Adwitiya warehouses; "THIRD_PARTY" for vendor
+  /// consignment locations. Defaults to OWN for legacy compatibility.
+  type        String            @default("OWN")
+  /// FK to the vendor whose location this is. Required when type=THIRD_PARTY,
+  /// must be null when type=OWN. Enforced in the server action, not the schema.
+  vendorId    String?
+  vendor      Vendor?           @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  createdAt   DateTime          @default(now())
+
+  adjustments StockAdjustment[]
+  grns        GRN[]
+  sales       Sale[]
+  orders      MarketplaceOrder[]
+  transfersFrom WarehouseTransfer[] @relation("TransferFrom")
+  transfersTo   WarehouseTransfer[] @relation("TransferTo")
+
+  @@index([vendorId])
+  @@index([type])
+  @@index([companyId])
+}
+
+/// The operating company (Adwitiya Global today). Pre-SaaS this is exactly
+/// one row marked `isPrimary=true`; the `getActiveCompany()` helper looks it
+/// up. When the SaaS rebuild lands (#106), one Company per tenant — the
+/// helper switches to context-based lookup, and the rest of the codebase
+/// continues unchanged because everything already reads from this table.
+model Company {
+  id           String   @id @default(cuid())
+  /// Full registered name (e.g. "Adwitiya Global Pvt Ltd").
+  legalName    String
+  /// Short brand name for headers and casual UI ("Adwitiya").
+  brandName    String
+  pan          String?
+  /// Tax Deduction Account Number — needed for TDS returns (#104).
+  tan          String?
+  /// Corporate Identification Number — MCA filings later.
+  cin          String?
+  /// Primary registered address (PPOB — Principal Place of Business).
+  address      String?
+  city         String?
+  state        String?
+  pincode      String?
+  country      String?  @default("India")
+  email        String?
+  mobile       String?
+  website      String?
+  /// Public URL of the company logo (used in PDFs + headers later).
+  logoUrl      String?
+  /// Reporting currency. INR for now; multi-currency comes with #105.
+  baseCurrency String   @default("INR")
+  /// Financial year start month (1-12). India = April = 4.
+  fyStartMonth Int      @default(4)
+  /// How new custom ledgers (Chart of Accounts) get their code:
+  ///   AUTO   — next code from the LEDGER document series (prefix + padding)
+  ///   MANUAL — admin types a unique code
+  ///   NONE   — name-only ledgers, code left blank (Tally-style)
+  /// Seeded + auto-created sub-ledgers always keep their codes regardless.
+  ledgerCodeMode String @default("AUTO")
+  /// Default bank for receivables — printed on customer invoices.
+  bankName     String?
+  accountNo    String?
+  ifsc         String?
+  isActive     Boolean  @default(true)
+  /// Marker for "the active company" pre-SaaS. Exactly one row should carry
+  /// `isPrimary=true`; the helper enforces this. Post-SaaS the field is
+  /// ignored and the helper routes by tenantId from the auth context.
+  isPrimary    Boolean  @default(false)
+
+  gstins       CompanyGSTIN[]
+  /// Users granted access to this company (#134). Admins skip this.
+  userAccess   UserCompany[]
+
+  // Multi-company back-relations (#133). Every operational table that
+  // carries `companyId` gets a reverse link here. Order matches the
+  // schema layout to make code review easy.
+  vendors             Vendor[]
+  categories          Category[]
+  items               Item[]
+  warehouses          Warehouse[]
+  customers           Customer[]
+  purchaseOrders      PurchaseOrder[]
+  grns                GRN[]
+  sales               Sale[]
+  payments            Payment[]
+  warehouseTransfers  WarehouseTransfer[]
+  otherCharges        OtherCharge[]
+  stockAdjustments    StockAdjustment[]
+  orPayments          OrPayment[]
+  marketplaceOrders   MarketplaceOrder[]
+  marketingCosts      MarketingCost[]
+  marketplaceRates    MarketplaceRate[]
+  series              Series[]
+  chartOfAccounts     ChartOfAccount[]
+  journalEntries      JournalEntry[]
+  bankAccounts        BankAccount[]
+  bankTransactions    BankTransaction[]
+  vendorOpeningBalances VendorOpeningBalance[]
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([isPrimary])
+}
+
+/// One GSTIN per state where the Company is registered. India's GST is
+/// state-scoped, so a company operating in multiple states holds multiple
+/// GSTINs. The `isDefault` row is the fallback when document-level
+/// resolution (e.g. ship-from warehouse) doesn't pick one.
+///
+/// The actual addresses declared under a GSTIN (PPOB + N APOBs) live in
+/// the child `CompanyGSTINPlace` table — a single GSTIN registration
+/// covers many physical locations.
+model CompanyGSTIN {
+  id               String   @id @default(cuid())
+  companyId        String
+  company          Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  /// 15-char GSTIN. Unique across the whole table — same number cannot be
+  /// registered twice even across companies.
+  gstin            String   @unique
+  /// State the GSTIN belongs to (matches first 2 digits of the GSTIN).
+  state            String
+  /// REGULAR | COMPOSITION | CASUAL | SEZ.
+  registrationType String   @default("REGULAR")
+  isActive         Boolean  @default(true)
+  /// Marker — the fallback GSTIN used when no document-level resolution
+  /// picks one. Exactly one row per company should carry this; enforced
+  /// in the server action.
+  isDefault        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  places           CompanyGSTINPlace[]
+
+  @@index([companyId])
+  @@index([state])
+}
+
+/// A physical address declared under a GSTIN. Each GSTIN registration in
+/// India lists one Principal Place of Business (PPOB) and N Additional
+/// Places of Business (APOBs) — branches, warehouses, godowns, showrooms,
+/// back offices. All places under one GSTIN are in the same state (since
+/// GST is state-scoped).
+///
+/// Invariants (enforced in server actions, not schema):
+///   - Exactly one place per GSTIN has placeType="PPOB". Adding a new
+///     PPOB demotes the previous one to "APOB".
+///   - Place.state matches the parent GSTIN's state (UI-only check —
+///     the data lives on the parent).
+///   - A Warehouse with type="THIRD_PARTY" cannot link to a Place — that
+///     consignment location is the vendor's GST responsibility, not ours.
+model CompanyGSTINPlace {
+  id           String   @id @default(cuid())
+  gstinId      String
+  gstin        CompanyGSTIN @relation(fields: [gstinId], references: [id], onDelete: Cascade)
+  /// Human-friendly identifier ("Surajpur HQ", "Greater Noida WH-1").
+  nickname     String
+  /// PPOB | APOB. The PPOB is the headquarters declared at registration.
+  placeType    String   @default("APOB")
+  address      String?
+  city         String?
+  pincode      String?
+  isActive     Boolean  @default(true)
+  /// Inverse relation — set when a Warehouse links to this place via
+  /// Warehouse.placeId. A place may be office-only (no warehouse).
+  warehouse    Warehouse?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gstinId])
+}
+
+/// The bill-to party for sales. Mirrors Vendor Master's address + GST shape
+/// (so multi-GSTIN lookup and address parsing are reusable), plus the
+/// receivables-specific fields a sales team needs: credit limit, payment
+/// terms, price tier, sales rep.
+///
+/// Accounting overlay (#107 Accounting Engine): every Customer row will
+/// auto-create a paired LedgerAccount row (type=ASSET, subType=SUNDRY_DEBTOR,
+/// linked via Customer.id) when that module lands. Until then this table
+/// is purely operational — the master used by Sales, Invoicing, AR Ageing,
+/// and Customer Statements.
+model Customer {
+  id              String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  /// Manual short code (e.g. "WST-001"). Unique if set, optional.
+  code            String?  @unique
+  name            String
+  email           String?  @unique
+  mobile          String?
+  whatsapp        String?
+
+  /// Customer's GSTIN (their bill-to registration). State extracted from
+  /// first 2 digits should match the customer's billing state.
+  gst             String?
+  /// GST registration type — drives B2B vs B2C classification on GSTR-1.
+  /// Default UNREGISTERED for walk-ins / online B2C buyers. REGULAR is the
+  /// common B2B case. SEZ_* + UIN_HOLDER + COMPOSITION are rarer but real.
+  gstRegType      String   @default("UNREGISTERED")
+  pan             String?
+
+  /// Bank details — used when refunding money to a customer (returns,
+  /// credit notes paid in cash). Optional; most B2C customers don't need it.
+  bankName        String?
+  accountNo       String?
+  ifsc            String?
+
+  /// Address (PPOB / primary billing). Same shape as Vendor for the
+  /// multi-GSTIN hint chip pattern to be reusable.
+  address         String?
+  city            String?
+  state           String?
+  pincode         String?
+  country         String?  @default("India")
+
+  /// "RETAIL" | "WHOLESALE" | "DISTRIBUTOR" | "MARKETPLACE". Drives the
+  /// price book lookup when invoicing — same SKU may have tier-specific
+  /// rates. Default RETAIL.
+  priceTier       String   @default("RETAIL")
+
+  /// Maximum outstanding receivable allowed before sales actions are
+  /// blocked. Null = no cap (trusted customer or anonymous walk-in).
+  creditLimit     Float?
+
+  /// Payment terms in days from invoice date. 0 = cash-on-delivery,
+  /// 30 = Net 30, 60 = Net 60. Drives ageing buckets + dunning.
+  paymentTermsDays Int     @default(0)
+
+  /// Free-text — the salesperson/account manager handling this customer.
+  /// Promoted to a User FK later (#108 Payment Reminders needs the email).
+  salesRep        String?
+
+  /// "ACTIVE" | "INACTIVE" | "SUSPENDED" (e.g. credit hold).
+  status          String   @default("ACTIVE")
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orders          MarketplaceOrder[]
+  ledger          ChartOfAccount?
+  bankTxns        BankTransaction[]
+
+  @@index([name])
+  @@index([status])
+  @@index([companyId])
+}
+
+/// Indian GST tax component taxonomy. Seeded — Indian tax law defines
+/// these; admins enable/disable per-region usage but never invent new
+/// component codes. Drives `resolveTaxBreakdown()` in lib/tax-resolver.
+///
+/// Codes:
+///   GST family    → CGST | SGST | UTGST | IGST (forward charge)
+///   Reverse       → CGST_RCM | SGST_RCM | UTGST_RCM | IGST_RCM
+///   Cess          → CESS (compensation cess, on top of GST)
+///   Govt buyers   → CGST_TDS | SGST_TDS | IGST_TDS
+///   E-commerce    → TCS
+model TaxComponent {
+  id           String   @id @default(cuid())
+  /// Canonical code (uppercase, underscore-separated). Unique.
+  code         String   @unique
+  /// Human-readable name ("Central GST", "Compensation Cess").
+  name         String
+  /// Family bucket: GST | CESS | TDS | TCS.
+  family       String   @default("GST")
+  /// FORWARD (seller collects) | REVERSE (buyer pays).
+  chargeType   String   @default("FORWARD")
+  /// When this component applies:
+  ///   INTRA_STATE (state-to-state-same), INTER_STATE, INTRA_UT.
+  /// CESS/TDS/TCS use "ANY" — they cross-cut all scopes.
+  scope        String
+  /// Fraction of the slab rate this component carries. CGST/SGST/UTGST
+  /// = 0.5 (each is half of the slab). IGST = 1.0 (whole slab). CESS and
+  /// TDS/TCS use 0 here — they have their own rate sources.
+  slabFraction Float    @default(1.0)
+  isActive     Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+}
+
+/// HSN/SAC code → applicable GST slab + cess, effective-dated. The GST
+/// council changes rates periodically; we resolve by the most recent
+/// effective row at the transaction date. Drives `resolveTaxBreakdown()`.
+model HsnRate {
+  id              String   @id @default(cuid())
+  /// 4–8 digit HSN for goods, 6 digit SAC for services. Free-text since
+  /// the GST council uses both 4-digit (small dealers) and 8-digit.
+  hsn             String
+  /// Short description (e.g. "T-shirts, knitted or crocheted").
+  description     String
+  /// Slab rate percent: 0 | 0.25 | 1 | 3 | 5 | 12 | 18 | 28.
+  slabRate        Float
+  /// Compensation cess rate, on top of slabRate. 0 for most items.
+  /// Examples: aerated drinks 12, tobacco 290, large SUVs 22.
+  cessRate        Float    @default(0)
+  /// REGULAR | ZERO_RATED | NIL_RATED | EXEMPT | NON_GST.
+  /// These four collapse to "0% on invoice" but go to different GSTR-1
+  /// rows and have different Input Tax Credit consequences.
+  supplyType      String   @default("REGULAR")
+  /// True when the BUYER pays GST instead of the seller (Reverse Charge
+  /// Mechanism). E.g. legal services, GTA, security services.
+  isReverseCharge Boolean  @default(false)
+  /// When this row becomes the canonical rate. Resolver picks the most
+  /// recent row whose effectiveFrom ≤ transaction date.
+  effectiveFrom   DateTime
+  /// Free-text rationale ("GST council 47th meeting, 18 Jul 2022").
+  notes           String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  createdBy       String?
+
+  @@index([hsn, effectiveFrom])
+  @@index([effectiveFrom])
+}
+
+/// Business models a vendor can operate under. The three codes
+/// (FTV / OR / FTV_NORETURN) are canonical and validated against the MODELS
+/// const; this table manages their label, remarks, return policy + active flag.
+model ModelMaster {
+  id           String   @id @default(cuid())
+  code         String   @unique
+  label        String
+  remarks      String?
+  returnPolicy String?
+  isActive     Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  /// How the vendor is paid under this model:
+  /// "ON_SALE"  → consignment, payable accrues when goods sell (FTV).
+  /// "ON_GRN"   → outright purchase, payable at GRN, due in paymentTermDays (OR).
+  paymentBasis    String @default("ON_SALE")
+  paymentTermDays Int    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Unit {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+}
+
+// ─── Transactions ────────────────────────────────────────────────────────────
+model PurchaseOrder {
+  id        String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  poNumber  String   @unique
+  vendorId  String
+  vendor    Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  poDate    DateTime
+  dueDate   DateTime?
+  /// "OPEN" | "CLOSED" | "PARTIALLY_RECEIVED" | "CANCELLED"
+  status    String   @default("OPEN")
+  /// Save-as-Draft flag. Drafts use a temp poNumber (DRAFT-...), don't allocate
+  /// a series number, and are excluded from list/reporting queries until
+  /// promoted. Promotion runs full validation + allocates the real poNumber.
+  isDraft   Boolean  @default(false)
+  notes     String?
+  total     Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  items     PurchaseOrderItem[]
+  grnItems  GRNItem[]
+
+  @@index([vendorId])
+  @@index([poDate])
+  @@index([status])
+  @@index([companyId])
+}
+
+model PurchaseOrderItem {
+  id           String   @id @default(cuid())
+  poId         String
+  po           PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  itemId       String
+  item         Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  qty          Float
+  rate         Float
+  taxRate      Float
+  total        Float
+  receivedQty  Float    @default(0)
+
+  grnItems     GRNItem[]
+
+  @@index([poId])
+  @@index([itemId])
+}
+
+model GRN {
+  id                String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  grnNo             String   @unique
+  grnDate           DateTime
+  /// "PURCHASE" (goods in) | "RTV" (Reject-Out, goods back to vendor) |
+  /// "RFV" (Reject-In, goods re-received from vendor)
+  type              String   @default("PURCHASE")
+  vendorId          String
+  vendor            Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  /// Warehouse the goods were received into (RTV: dispatched from). Null = unassigned (legacy).
+  warehouseId       String?
+  warehouse         Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  vendorInvoiceNo   String?
+  vendorInvoiceDate DateTime?
+  total             Float    @default(0)
+  /// Batch-level fields for the Batch Summary Report (batch = GRN).
+  reviewDate        DateTime?
+  batchRemarks      String?
+  /// Save-as-Draft flag — see PurchaseOrder.isDraft. Draft GRNs use a temp
+  /// grnNo, don't allocate a series number, don't move stock, don't post to the
+  /// ledger, and are excluded from reports until promoted.
+  isDraft           Boolean  @default(false)
+  /// Opening-balance receipt — stock loaded at go-live, not a live purchase.
+  /// Dated to the go-live cutoff and valued into inventory; posted via the
+  /// opening journal (AUTO_OPENING) rather than a normal purchase entry.
+  isOpening         Boolean  @default(false)
+  /// Opening receipts only: true = already settled before go-live (funded by
+  /// Opening Balance Equity, creates no vendor payable); false = still payable
+  /// (Sundry Creditors → seeds the vendor's opening balance).
+  openingPaid       Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  createdBy         String?
+
+  items             GRNItem[]
+  /// GSTR-2B reconciliation (#132 — GST Phase 3). NULL until admin matches
+  /// this GRN to an imported 2B line. Matched GRNs count toward eligible
+  /// ITC on the GSTR-3B 4(A5) row; unmatched ones are "at risk".
+  matchedItc2bLineId String?  @unique
+  matchedItc2bLine   GSTR2BLine? @relation(fields: [matchedItc2bLineId], references: [id], onDelete: SetNull)
+
+  @@index([vendorId])
+  @@index([grnDate])
+  @@index([type])
+  @@index([warehouseId])
+  @@index([companyId])
+}
+
+model GRNItem {
+  id            String   @id @default(cuid())
+  grnId         String
+  grn           GRN      @relation(fields: [grnId], references: [id], onDelete: Cascade)
+  itemId        String
+  item          Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  poItemId      String?
+  poItem        PurchaseOrderItem? @relation(fields: [poItemId], references: [id], onDelete: SetNull)
+  poId          String?
+  po            PurchaseOrder? @relation(fields: [poId], references: [id], onDelete: SetNull)
+  /// Snapshot of the item's model on the GRN date ("FTV" | "OR" | "FTV_NORETURN").
+  /// Drives whether this receipt creates an OR payable (GRN+term) or is FTV stock-in only.
+  model         String?
+  qty           Float
+  rejectedQty   Float    @default(0)
+  rate          Float
+  taxRate       Float
+  taxableValue  Float
+  tax           Float
+  totalValue    Float
+  batchNo       String
+  batchExpDate  DateTime
+
+  @@index([grnId])
+  @@index([itemId])
+  @@index([poItemId])
+  @@index([poId])
+}
+
+model Sale {
+  id              String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  vchDate         DateTime
+  marketplace     String
+  itemId          String
+  item            Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  /// Snapshot of item.vendorId at import time — prevents re-attribution when an
+  /// item is later moved to a different vendor.
+  vendorId        String
+  /// Warehouse the sale/return was fulfilled from. Null = unassigned (legacy).
+  warehouseId     String?
+  warehouse       Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  /// "SALE" | "RETURN"
+  transactionType String
+  /// Snapshot of the item's model on the sale date ("FTV" | "OR" | "FTV_NORETURN").
+  /// FTV sales accrue a vendor payout; OR sales don't (already paid via GRN+term).
+  model           String?
+  qtySold         Float    @default(0)
+  qtyReturn       Float    @default(0)
+  qtyRTO          Float    @default(0)
+  /// VENDOR-side transfer price snapshot at vchDate — what we owe the
+  /// vendor per unit on this Sale line. NEVER the customer-facing
+  /// salePrice. The Sale row is the source of the vendor-facing portal
+  /// view (/portal/sales); leaking customer pricing through here would
+  /// expose our retail margins to vendors.
+  unitRate        Float
+  /// Snapshot of effective tax rate at vchDate.
+  taxRate         Float
+  manualRemarks   String?
+  /// New (Orders unification, #114): when this Sale was auto-generated from
+  /// an Order row. Cascade-delete on parent Order means rolling back an
+  /// import cleans up the stock-side row too. NULL on legacy manually-
+  /// entered Sales — those keep working unchanged.
+  sourceOrderId   String?  @unique
+  sourceOrder     MarketplaceOrder? @relation(fields: [sourceOrderId], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now())
+  createdBy       String?
+
+  @@index([itemId])
+  @@index([itemId, vchDate])
+  @@index([vchDate])
+  @@index([marketplace])
+  @@index([transactionType])
+  @@index([vendorId])
+  @@index([warehouseId])
+  @@index([companyId])
+}
+
+model Payment {
+  id          String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  vendorId    String
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  /// "YYYY-MM" — calendar month the payment is against (the month sales were earned).
+  month       String
+  /// "FTV" | "OR" | "FTV_NORETURN"
+  model       String
+  amountPaid  Float    @default(0)
+  /// "PENDING" | "PARTIAL" | "PAID"
+  status      String   @default("PENDING")
+  utr         String?
+  remarks     String?
+  paidOn      DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdBy   String?
+
+  @@unique([vendorId, month, model])
+  @@index([vendorId])
+  @@index([month])
+  @@index([status])
+  @@index([companyId])
+}
+
+model WarehouseTransfer {
+  id        String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  /// Auto-allocated document number (TR- series). Null for legacy rows.
+  docNo     String?
+  date      DateTime
+  itemId    String
+  item      Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  /// LEGACY direction ("SENT_TO_WH" | "RETURN_TO_HO") relative to HO. New rows
+  /// use fromWarehouseId + toWarehouseId instead; type can be null.
+  type      String?
+  /// Free-form transfer category (SJIT / SOR / Other / custom). Null for legacy.
+  transferType String?
+  /// LEGACY free-text location. New rows use the warehouse FKs.
+  location  String?
+  /// Source warehouse the qty leaves. Set on new transfers; null on legacy rows.
+  fromWarehouseId String?
+  fromWarehouse   Warehouse? @relation("TransferFrom", fields: [fromWarehouseId], references: [id], onDelete: SetNull)
+  /// Destination warehouse the qty arrives in. Set on new transfers; null on legacy.
+  toWarehouseId   String?
+  toWarehouse     Warehouse? @relation("TransferTo", fields: [toWarehouseId], references: [id], onDelete: SetNull)
+  qty       Float
+  notes     String?
+  createdAt DateTime @default(now())
+  createdBy String?
+
+  @@index([itemId])
+  @@index([date])
+  @@index([type])
+  @@index([transferType])
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
+  @@index([companyId])
+}
+
+/// Misc charges billed to a vendor that DEDUCT from the vendor ledger
+/// (e.g. penalties, logistics recovery, deductions). Recorded as a debit.
+model OtherCharge {
+  id        String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  chargeNo  String   @unique
+  date      DateTime
+  vendorId  String
+  vendor    Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  /// "DEBIT" = debit note (reduces what we owe) | "CREDIT" = credit note (increases what we owe).
+  direction String   @default("DEBIT")
+  /// Model for per-model vendor-ledger reporting (mandatory going forward).
+  model     String?
+  reason    String
+  taxable   Float    @default(0)
+  gstRate   Float    @default(0)
+  gst       Float    @default(0)
+  total     Float    @default(0)
+  notes     String?
+  createdAt DateTime @default(now())
+  createdBy String?
+
+  @@index([vendorId])
+  @@index([date])
+  @@index([companyId])
+}
+
+/// Manual inventory correction (physical vs system) — signed qtyChange.
+/// Positive adds stock, negative removes it. Optionally scoped to a warehouse.
+model StockAdjustment {
+  id          String     @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  adjNo       String?
+  date        DateTime
+  itemId      String
+  item        Item       @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  warehouseId String?
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  qtyChange   Float
+  reason      String
+  notes       String?
+  createdAt   DateTime   @default(now())
+  createdBy   String?
+
+  @@index([itemId])
+  @@index([date])
+  @@index([warehouseId])
+  @@index([companyId])
+}
+
+/// Payment voucher against a vendor's OR (ON_GRN / outright-purchase) account.
+/// OR is settled as a running ledger — free-form payment entries reduce the
+/// balance built from OR GRNs (due = GRN date + term). FTV uses Payment (monthly).
+model OrPayment {
+  id          String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  voucherNo   String?
+  vendorId    String
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  date        DateTime
+  amount      Float
+  reference   String?  // UTR / cheque / NEFT ref
+  particulars String?
+  createdAt   DateTime @default(now())
+  createdBy   String?
+
+  @@index([vendorId])
+  @@index([date])
+  @@index([companyId])
+}
+
+// ─── Marketplace / Margin ────────────────────────────────────────────────────
+/// Customer-side marketplace order lines (Amazon / Myntra etc.) — the actual
+/// selling price + GST per line, imported via the "Common Order" format. Drives
+/// the Margin Report. Distinct from Sale (which is at vendor transfer price).
+/// "Orders" — the unified sell-side ingest (formerly MarketplaceOrder).
+/// Every Order row auto-creates a paired Sale row in the same transaction
+/// via `auto-push` so admins only have one place to import/edit and the
+/// downstream Stock Report / Vendor Ledger / Margin Report stay in sync.
+///
+/// (The Prisma model name stays `MarketplaceOrder` for now to avoid a
+/// disruptive schema rename — Phase C of the unification will move the
+/// route surface to /orders and rename the model.)
+model MarketplaceOrder {
+  id            String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  date          DateTime
+  itemId        String
+  item          Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  /// Sales channel: "AMAZON" | "MYNTRA" | "FLIPKART" | "WEBSITE" | "DIRECT" | …
+  /// Distinguishes marketplace from non-marketplace orders. Imports stamp
+  /// the marketplace value; admin direct-entry uses "DIRECT" by default.
+  marketplace   String
+  /// New (Orders unification, #114): channel family. "MARKETPLACE" |
+  /// "DIRECT" | "WEBSITE" | "LEGACY". LEGACY is reserved for rows the
+  /// Phase B backfill creates from orphaned Sales — admin never picks it.
+  channel       String   @default("MARKETPLACE")
+  /// "SALE" | "RETURN" | "RTO"
+  type          String   @default("SALE")
+  placeOfSupply String?
+  /// Warehouse the order ships from (drives ship-from GSTIN + stock
+  /// movement on the paired Sale). Null when unassigned (legacy imports).
+  warehouseId   String?
+  warehouse     Warehouse? @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  qty           Float    @default(0)
+  /// Per-unit selling price on the marketplace (customer-facing) —
+  /// what the buyer paid.
+  salePrice     Float    @default(0)
+  /// Per-unit price we owe the vendor for this unit (vendor-facing) —
+  /// snapshot of `ItemPriceRevision.transferPrice` at order.date. Shown
+  /// alongside salePrice on every Order surface so admin sees both sides
+  /// of the deal at a glance.
+  ///
+  /// IMPORTANT: this column is currently a DISPLAY MIRROR only. Vendor
+  /// payouts still resolve from `ItemPriceRevision` at Sale.vchDate (the
+  /// existing Vendor Ledger query is untouched). Step 2 of the rollout
+  /// will switch the Ledger to read this snapshot so admin overrides on
+  /// individual Orders can flow into vendor payment. Until then, edits to
+  /// this field are audit-logged but cosmetic.
+  transferPrice Float    @default(0)
+  taxableValue  Float    @default(0)
+  gstRate       Float    @default(0)
+  cgst          Float    @default(0)
+  sgst          Float    @default(0)
+  igst          Float    @default(0)
+  total         Float    @default(0)
+  /// Free-text — marketplace order ID, return reason, manual note, etc.
+  remarks       String?
+
+  /// Invoice number printed on the document the customer gets. Auto-assigned
+  /// via the INV- series for DIRECT / WEBSITE / B2B sales (the ones that
+  /// need their own tax invoice). NULL for MARKETPLACE channel — those roll
+  /// into GSTR-1 Section 7 (B2C Small) as state+rate summaries and don't
+  /// need a per-row invoice number.
+  invoiceNo     String?  @unique
+  /// Invoice date. Defaults to `date` when null; kept separate so admins can
+  /// override (e.g. invoice raised on a later date than the order).
+  invoiceDate   DateTime?
+  /// Reverse charge marker for B2B supplies under RCM. Almost always false;
+  /// flag is here so the GSTR-1 4B section is wired and ready when needed.
+  revCharge     Boolean  @default(false)
+
+  createdAt     DateTime @default(now())
+  createdBy     String?
+
+  /// Customer FK — drives B2B vs B2C classification on GSTR-1 via
+  /// `customer.gstRegType`. NULL for marketplace orders (we don't know
+  /// who the buyer was beyond an Amazon order ID) and is fine — those
+  /// fall back to "B2C" by default. Set on Record Sale form / direct
+  /// channel orders.
+  customerId    String?
+  customer      Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  /// Inverse relation — the auto-pushed Sale row. Cascade-delete via the
+  /// Sale side means deleting an Order removes its Sale automatically.
+  sale          Sale?
+  /// Receipt allocations against this order (Phase 3). Each row is one
+  /// chunk of a customer payment clearing this invoice. Outstanding =
+  /// total − Σ allocations.amount.
+  allocations   BankReceiptAllocation[]
+
+  @@index([itemId])
+  @@index([date])
+  @@index([marketplace])
+  @@index([channel])
+  @@index([type])
+  @@index([warehouseId])
+  @@index([customerId])
+  @@index([companyId])
+}
+
+/// Marketing spend per SKU per month (Month | SKU | Marketing Spent). Feeds the
+/// Marketing Cost column of the Margin Report.
+model MarketingCost {
+  id        String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  itemId    String
+  item      Item     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  /// "YYYY-MM"
+  month     String
+  amount    Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  @@unique([itemId, month])
+  @@index([itemId])
+  @@index([month])
+  @@index([companyId])
+}
+
+/// Commission + logistics rates per marketplace, applied as a percentage of net
+/// sale value to derive those costs in the Margin Report.
+model MarketplaceRate {
+  id            String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  marketplace   String   @unique
+  commissionPct Float    @default(0)
+  logisticsPct  Float    @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  @@index([companyId])
+}
+
+// ─── Document number series ─────────────────────────────────────────────────
+model Series {
+  id         String   @id @default(cuid())
+  /// Multi-company scope (#134). Each company gets its own counter per
+  /// docType — so PO-00001 starts fresh in every company.
+  companyId  String?
+  company    Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  docType    String // "PO", "GRN", "INV", "JV", "BT" …
+  prefix     String
+  nextNumber Int      @default(1)
+  padding    Int      @default(5)
+  updatedAt  DateTime @updatedAt
+  @@unique([companyId, docType])
+  @@index([companyId])
+}
+
+// ─── Email OTP (used by /apply onboarding flow) ──────────────────────────────
+model EmailOTP {
+  id         String    @id @default(cuid())
+  email      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  verified   Boolean   @default(false)
+  /// Set when the verification is consumed by a final submission. Prevents
+  /// a stale-but-still-fresh OTP from authorizing further uploads / submits.
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  lastSentAt DateTime  @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+// ─── Audit trail ─────────────────────────────────────────────────────────────
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  entity    String
+  entityId  String
+  action    String   // CREATE | UPDATE | DELETE
+  before    String?  // JSON
+  after     String?  // JSON
+  at        DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([at])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Accounting Engine — Phase 1 (#125 / #107)
+//
+//  Three tables: ChartOfAccount (the master), JournalEntry + JournalLine
+//  (the double-entry book). Auto-created sub-ledger rows under Sundry
+//  Debtors / Sundry Creditors are linked back to Customer / Vendor via the
+//  optional FKs so the Customer page can show "Account: 1130-001" later.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row per ledger account. Tally-style 4-digit codes for top-level
+/// groups + subgroups (1000-1999 = Assets etc.) with hierarchical
+/// children codes like "1130-001" for individual customer sub-ledgers.
+model ChartOfAccount {
+  id             String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  /// Tally-friendly code (e.g. "1110" Cash, "1130" Sundry Debtors).
+  /// Unique within a company, not globally — every company can have
+  /// its own clean "1110" without colliding with another company's.
+  /// Sub-ledger children use "1130-001", "2110-001" pattern; that
+  /// extension still works because the same composite scopes it.
+  /// Optional: name-only ledgers (Tally-style) are allowed when the
+  /// company's `ledgerCodeMode` is NONE. NULLs don't collide in the
+  /// composite unique, so many code-less ledgers can coexist.
+  code           String?
+  name           String
+  /// ASSET | LIABILITY | INCOME | EXPENSE | EQUITY — drives report bucketing.
+  type           String
+  /// Optional finer-grained classification (CURRENT_ASSET, FIXED_ASSET,
+  /// CURRENT_LIABILITY, LONG_TERM_LIABILITY, OPERATING_EXPENSE, etc.).
+  subType        String?
+  /// Self-FK for tree hierarchy. Top-level groups have null parent.
+  parentId       String?
+  parent         ChartOfAccount?  @relation("CoATree", fields: [parentId], references: [id], onDelete: Restrict)
+  children       ChartOfAccount[] @relation("CoATree")
+  /// Opening balance at the start of the current FY. Sign convention:
+  /// debit-balance positive for Assets + Expenses; credit-balance
+  /// positive for Liabilities + Income + Equity.
+  openingBalance Float    @default(0)
+  /// Optional FK back to the operational master that owns this sub-ledger.
+  /// Set on auto-created Customer / Vendor / Bank sub-ledgers; null on
+  /// standard seeded accounts.
+  customerId     String?  @unique
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  vendorId       String?  @unique
+  vendor         Vendor?   @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  bankAccountId  String?  @unique
+  bankAccount    BankAccount? @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  /// True for system-seeded / auto-created rows. Admin can rename them
+  /// but the server action refuses to delete them.
+  isSystem       Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  lines          JournalLine[]
+  /// BankTransactions that point to this CoA as their counter-side.
+  bankContraTxns BankTransaction[] @relation("BankContraCoA")
+
+  @@unique([companyId, code])
+  @@index([type])
+  @@index([parentId])
+  @@index([isActive])
+  @@index([companyId])
+}
+
+/// One journal entry = one balanced set of debit/credit lines for a date.
+/// Source tracks where the entry came from (manual admin, or auto-posted
+/// from a Sale / GRN / Payment etc.) so we can drill back from the
+/// Trial Balance to the originating document.
+model JournalEntry {
+  id            String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  voucherNo     String   @unique
+  date          DateTime
+  narration     String?
+  /// MANUAL | AUTO_SALE | AUTO_GRN | AUTO_PAYMENT | AUTO_RECEIPT |
+  /// AUTO_DEPRECIATION | AUTO_OPENING.
+  source        String   @default("MANUAL")
+  sourceRefId   String?
+  createdBy     String?
+  createdAt     DateTime @default(now())
+
+  lines         JournalLine[]
+
+  @@index([date])
+  @@index([source, sourceRefId])
+  @@index([companyId])
+}
+
+/// One side of a journal entry — exactly one of debit / credit per row
+/// should be positive (server action enforces). Sum of debits == sum of
+/// credits per parent JournalEntry (also server-enforced).
+model JournalLine {
+  id          String   @id @default(cuid())
+  entryId     String
+  entry       JournalEntry   @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  accountId   String
+  account     ChartOfAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  debit       Float    @default(0)
+  credit      Float    @default(0)
+  narration   String?
+
+  @@index([entryId])
+  @@index([accountId])
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Banking Module (#124) — Phase 1
+//  One row per own bank account. Each one auto-creates a CoA sub-ledger
+//  under 1120 (Bank Accounts), code 1120-001, 1120-002, … . Bank
+//  transactions auto-post a balanced JournalEntry on create / delete.
+// ────────────────────────────────────────────────────────────────────────────
+
+model BankAccount {
+  id             String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  /// Human-friendly label shown across the UI ("HDFC Current — 1234").
+  name           String
+  bankName       String
+  /// Last 4 digits or full account number — admin choice.
+  accountNo      String
+  ifsc           String?
+  branch         String?
+  /// SAVINGS | CURRENT | OD | CASH (cash drawer modeled as a "bank account"
+  /// for unified receipt/payment recording).
+  type           String   @default("CURRENT")
+  currency       String   @default("INR")
+  openingBalance Float    @default(0)
+  /// Opening as-of date — used so reports can show "since this date"
+  /// without forcing a year-close.
+  openingAsOf    DateTime?
+  isActive       Boolean  @default(true)
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  ledger         ChartOfAccount?
+  /// Bank transactions where this is the primary account.
+  txns           BankTransaction[] @relation("PrimaryBankTxns")
+  /// Bank transactions where this is the contra (TRANSFER destination).
+  contraTxns     BankTransaction[] @relation("ContraBankTxns")
+  /// Statement lines imported for this account.
+  statementLines BankStatementLine[]
+
+  @@index([isActive])
+  @@index([companyId])
+}
+
+/// One bank-side movement. Type drives auto-post direction:
+///   RECEIPT  — money in     (Dr Bank · Cr counter)
+///   PAYMENT  — money out    (Dr counter · Cr Bank)
+///   CHARGE   — bank fees    (Dr Bank Charges 5280 · Cr Bank)  default counter
+///   INTEREST — credit int.  (Dr Bank · Cr Interest Income 4210) default counter
+///   TRANSFER — inter-account (Dr contraBank · Cr primary Bank)
+/// `contraAccountId` is the CoA other-side resolved at create time.
+/// For TRANSFER, `contraBankAccountId` points to the destination bank.
+model BankTransaction {
+  id              String   @id @default(cuid())
+  /// Multi-company scope (#133). Nullable for backfill — flipped to
+  /// NOT NULL once `prisma/backfill-company-id.mjs` runs.
+  companyId      String?
+  company        Company? @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  txnNo           String   @unique
+  date            DateTime
+  bankAccountId   String
+  bankAccount     BankAccount @relation("PrimaryBankTxns", fields: [bankAccountId], references: [id], onDelete: Restrict)
+  type            String
+  amount          Float
+  refNo           String?
+  narration       String?
+  /// Optional — for RECEIPT against a Customer (resolves to that customer's
+  /// CoA sub-ledger). Null when paid against a free-form account.
+  customerId      String?
+  customer        Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  /// Optional — for PAYMENT to a Vendor (resolves to that vendor's
+  /// CoA sub-ledger).
+  vendorId        String?
+  vendor          Vendor? @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  /// For TRANSFER — destination bank account.
+  contraBankAccountId String?
+  contraBank      BankAccount? @relation("ContraBankTxns", fields: [contraBankAccountId], references: [id], onDelete: Restrict)
+  /// The CoA account picked as the other side of the entry. Server resolves
+  /// this from (customerId / vendorId / contraBank / explicit pick) at
+  /// create time so reposts and reads don't need to re-walk the logic.
+  contraAccountId String?
+  contraAccount   ChartOfAccount? @relation("BankContraCoA", fields: [contraAccountId], references: [id], onDelete: SetNull)
+  /// Statement reconciliation (Phase 2 wiring).
+  reconciled      Boolean  @default(false)
+  reconciledAt    DateTime?
+  /// Statement lines that point to this txn as their match. Usually 1:1
+  /// (one statement row clears one book row) but modeled as a list so a
+  /// split deposit can resolve later without a schema migration.
+  matchedLines    BankStatementLine[]
+  /// Receipt allocations (Phase 3) — only populated for type=RECEIPT.
+  /// Sum of these ≤ amount; the unallocated remainder sits in A/R.
+  allocations     BankReceiptAllocation[]
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([bankAccountId, date])
+  @@index([type])
+  @@index([reconciled])
+  @@index([companyId])
+}
+
+/// One row imported from a bank statement (CSV / XLSX). Lifecycle:
+///   imported (UNMATCHED) → admin matches to a BankTransaction (MATCHED)
+///   or marks it irrelevant (IGNORED) for the reconciliation total.
+/// `importBatchId` groups every row from a single upload so re-imports
+/// of the same file can be undone wholesale.
+model BankStatementLine {
+  id              String   @id @default(cuid())
+  bankAccountId   String
+  bankAccount     BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  importBatchId   String
+  statementDate   DateTime
+  /// Free-text narration printed on the statement.
+  description     String
+  /// UTR / cheque no / NEFT ref the bank shows.
+  refNo           String?
+  /// Money out of the account (positive number). Mutually exclusive with credit.
+  debit           Float    @default(0)
+  /// Money into the account (positive number). Mutually exclusive with debit.
+  credit          Float    @default(0)
+  /// Running balance per the statement (when provided). Useful for drift detection.
+  balance         Float?
+  /// UNMATCHED | MATCHED | IGNORED
+  matchStatus     String   @default("UNMATCHED")
+  matchedTxnId    String?
+  matchedTxn      BankTransaction? @relation(fields: [matchedTxnId], references: [id], onDelete: SetNull)
+  matchedAt       DateTime?
+  matchedBy       String?
+  /// Set true when admin clicks Ignore — keeps the row but pulls it out
+  /// of the unmatched count so the dashboard can show "no work left".
+  importedAt      DateTime @default(now())
+  importedBy      String?
+
+  @@index([bankAccountId, statementDate])
+  @@index([importBatchId])
+  @@index([matchStatus])
+  @@index([matchedTxnId])
+}
+
+/// GSTR-2B line item imported from the portal (#132 — GST Phase 3).
+/// Lifecycle: UNMATCHED → MATCHED (to a recorded GRN) or IGNORED.
+/// Filing GSTIN + period + importBatchId scope the rows.
+model GSTR2BLine {
+  id              String   @id @default(cuid())
+  importBatchId   String
+  filingGstin     String
+  /// YYYY-MM — the return period this 2B covers.
+  period          String
+  /// Vendor's GSTIN as it appears on the portal.
+  vendorGstin     String
+  vendorName      String?
+  invoiceNo       String
+  invoiceDate     DateTime
+  /// Invoice category — R=Regular · SEZWP/SEZWOP/DE · CDNR (credit/debit note).
+  invoiceType     String   @default("R")
+  invoiceValue    Float    @default(0)
+  taxableValue    Float    @default(0)
+  cgst            Float    @default(0)
+  sgst            Float    @default(0)
+  igst            Float    @default(0)
+  cess            Float    @default(0)
+  /// 2-digit GSTIN state code where the supply was made.
+  placeOfSupply   String?
+  /// Reverse charge flag from portal.
+  reverseCharge   Boolean  @default(false)
+  /// UNMATCHED | MATCHED | IGNORED
+  matchStatus     String   @default("UNMATCHED")
+  matchedGrn      GRN?
+  matchedAt       DateTime?
+  matchedBy       String?
+  importedAt      DateTime @default(now())
+  importedBy      String?
+
+  @@index([filingGstin, period])
+  @@index([vendorGstin])
+  @@index([invoiceNo])
+  @@index([matchStatus])
+  @@index([importBatchId])
+}
+
+/// Order-level receipt allocation (#130 — Banking Phase 3).
+///
+/// One RECEIPT BankTransaction can be split across multiple outstanding
+/// orders; one order can be cleared by multiple receipts (partial
+/// payments). A row here means "this much of receipt X clears order Y".
+///
+/// Outstanding amount per order = order.total − Σ allocations.amount.
+/// Receipt unallocated = txn.amount − Σ allocations.amount.
+model BankReceiptAllocation {
+  id                String   @id @default(cuid())
+  bankTransactionId String
+  bankTransaction   BankTransaction @relation(fields: [bankTransactionId], references: [id], onDelete: Cascade)
+  orderId           String
+  order             MarketplaceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amount            Float
+  allocatedAt       DateTime @default(now())
+  allocatedBy       String?
+
+  @@index([bankTransactionId])
+  @@index([orderId])
+}

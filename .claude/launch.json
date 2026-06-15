@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ftv-dev",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "scripts\\dev-launcher.cmd"],
+      "port": 3000
+    }
+  ]
+}
