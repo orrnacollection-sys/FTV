@@ -56,9 +56,6 @@ export default async function LoginPage({
           <div className="mt-6">
             <LoginForm next={sp?.next} />
           </div>
-          <div className="mt-6 rounded border border-dashed border-brand-yellow-dark bg-brand-yellow-50 px-3 py-2 text-xs text-ink-mid">
-            Demo: <b>ankur</b> / <b>ankur@123</b>
-          </div>
           <div className="mt-4 text-center text-xs text-ink-faint">
             New vendor? <a href="/apply" className="font-bold text-brand-yellow-dark hover:underline">Apply to onboard →</a>
           </div>
