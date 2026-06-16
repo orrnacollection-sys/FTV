@@ -20,19 +20,19 @@ const securityHeaders = [
         // on script-src is necessary; we partially compensate by setting
         // 'strict-dynamic' so only Next's signed scripts can load further code.
         {
-          key: "Content-Security-Policy",
-          value: [
-            "default-src 'self'",
-            "script-src 'self' 'unsafe-inline'",
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-            "font-src 'self' https://fonts.gstatic.com data:",
-            "img-src 'self' data: blob: https://*.public.blob.vercel-storage.com",
-            "connect-src 'self' https://*.public.blob.vercel-storage.com",
-            "frame-ancestors 'none'",
-            "base-uri 'self'",
-            "form-action 'self'",
-            "object-src 'none'",
-          ].join("; "),
+  key: "Content-Security-Policy",
+  value: [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https://*.public.blob.vercel-storage.com",
+    "connect-src 'self' https://*.public.blob.vercel-storage.com",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "object-src 'none'",
+  ].join("; "),
         },
       ]
     : []),
