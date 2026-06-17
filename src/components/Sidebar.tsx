@@ -476,9 +476,9 @@ export function Sidebar() {
             />
           </span>
         )}
-        {!collapsed && leaf.shortcut && !leaf.soon && (
+       {/* {!collapsed && leaf.shortcut && !leaf.soon && (
           <Kbd chord={leaf.shortcut} className="bg-white/10 border-white/15 text-white/60" />
-        )}
+        )}*/}
         {!collapsed && leaf.soon && (
           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-wider text-white/50">soon</span>
         )}
